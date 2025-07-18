@@ -23,14 +23,14 @@ const preUploads3 = asyncHandler(async (req, res, _) => {
     const s3client = new S3Client({
         region: process.env.AWS_REGION,
         credentials: {
-            accessKeyId: process.env.AWS_ACCESS_KEY,
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
             secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
         }
     });
 
     const cmd = new PutObjectCommand({
         Bucket: process.env.BUCKET_NAME,
-        Key: path.basename(filePath),
+        Key: `videos/${path.basename(filePath)}`,
         Body: await readFile(filePath),
         ContentType: req.file.mimetype,
         ACL: 'private',
