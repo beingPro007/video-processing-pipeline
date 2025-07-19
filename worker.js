@@ -3,11 +3,11 @@ import { createWriteStream } from "fs";
 import path from "path";
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { pipeline } from "stream/promises";
 import { spawn } from "child_process";
 import dotenv from "dotenv";
-import { ApiError } from "./utils/ApiError";
+import { ApiError } from "./utils/ApiError.js";
 
 dotenv.config();
 
@@ -88,22 +88,20 @@ const analyzeVideoComplexity = (videoPath) => {
 };
 
 const storeMetadataToDynamo = async (videoId, metadata) => {
-    const update = {
-        TableName: process.env.DYNAMO_TABLE_NAME,
-        Key: { videoId },
-        UpdateExpression: "set metadata.analysis = :meta",
-        ExpressionAttributeValues: {
-            ":meta": metadata
-        }
-    };
     try {
-        await ddb.send(new UpdateCommand(update));
-        console.log("✅ Metadata saved to DynamoDB.");
+        await ddb.send(new PutCommand({
+            TableName: process.env.DYNAMO_METADATA_TABLE,
+            Item: {
+                videoId,
+                ...metadata,
+                createdAt: new Date().toISOString()
+            }
+        }));
+        console.log("🧠 Metadata inserted successfully.");
     } catch (err) {
         console.error("❌ Failed to save metadata:", err);
     }
 };
-
 const run = async () => {
     const messagePath = path.resolve("sqs-message.json");
     if(!messagePath){
