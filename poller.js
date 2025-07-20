@@ -96,7 +96,7 @@ async function checkQueueAndLaunchWorker() {
         try {
             console.log("🚀 Launching container with message file...");
             await execPromise(
-                `docker run --rm -v ${process.cwd()}:/app --env-file .env video-encoder:v13`
+                `docker run --rm -v ${process.cwd()}:/app --env-file .env video-encoder:v15`
             );
         } catch (err) {
             console.error("❌ Worker container failed:", err.stderr || err.message);
