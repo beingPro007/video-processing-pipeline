@@ -3,37 +3,49 @@ import fs from "fs/promises";
 import path from "path";
 
 /**
- * Uploads a local video file to S3 under the processed/{videoId}/{resolution}/{filename} path.
+ * Recursively uploads all files in localDir to S3.
  * 
  * @param {Object} params
  * @param {string} params.bucket - S3 bucket name
- * @param {string} params.key - Original key (e.g., "videos/video.mp4")
- * @param {string} params.videoId - Unique video ID
- * @param {string} params.outputPath - Local path to processed file
- * @param {object} params.s3 - AWS S3 client instance
+ * @param {string} params.localDir - Local folder path to upload
+ * @param {string} params.s3Prefix - S3 key prefix
+ * @param {object} params.s3 - AWS S3 client
  */
-export async function uploadProcessedFile({ bucket, key, videoId, outputPath, s3 }) {
-    const fileName = path.basename(key); // e.g. "video.mp4"
-    const resolution = path.basename(outputPath).split('_')[1].replace('.mp4', '');
-    const outputKey = `processed/${videoId}/${resolution}/${fileName}`;
+export async function uploadHLSDirectory({ bucket, localDir, s3Prefix, s3 }) {
+    async function walkAndUpload(dir) {
+        const entries = await fs.readdir(dir, { withFileTypes: true });
 
-    try {
-        const processedFile = await fs.readFile(outputPath);
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            const relativePath = path.relative(localDir, fullPath).replace(/\\/g, "/");
+            const s3Key = `${s3Prefix}/${relativePath}`;
 
-        console.log(`📤 Uploading ${resolution} of file ${fileName} to S3...`);
-        await s3.send(new PutObjectCommand({
-            Bucket: bucket,
-            Key: outputKey,
-            Body: processedFile,
-            ContentType: "video/mp4"
-        }));
+            if (entry.isDirectory()) {
+                await walkAndUpload(fullPath);
+            } else {
+                const body = await fs.readFile(fullPath);
+                const contentType = getContentType(entry.name);
 
-        console.log(`✅ Uploaded ${resolution} of file ${fileName}:`, outputKey);
-    } catch (error) {
-        throw new Error(`❌ Failed to upload ${resolution}: ${error.message}`);
-    } finally {
-        fs.unlink(outputPath).catch(err => {
-            console.warn(`⚠️ Could not delete temp file ${outputPath}:`, err.message);
-        });
+                console.log(`📤 Uploading ${s3Key}...`);
+                await s3.send(new PutObjectCommand({
+                    Bucket: bucket,
+                    Key: s3Key,
+                    Body: body,
+                    ContentType: contentType
+                }));
+            }
+        }
     }
+
+    await walkAndUpload(localDir);
+    console.log(`✅ All files uploaded to s3://${bucket}/${s3Prefix}`);
+}
+
+/**
+ * Returns appropriate content type for HLS files.
+ */
+function getContentType(fileName) {
+    if (fileName.endsWith(".m3u8")) return "application/vnd.apple.mpegurl";
+    if (fileName.endsWith(".ts")) return "video/mp2t";
+    return "application/octet-stream";
 }

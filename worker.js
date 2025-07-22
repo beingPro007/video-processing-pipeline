@@ -1,92 +1,114 @@
-import fs from "fs/promises";
+import fs, { rm } from "fs/promises";
 import { createWriteStream } from "fs";
 import path from "path";
 import { GetObjectCommand } from "@aws-sdk/client-s3";
 import { pipeline } from "stream/promises";
 import dotenv from "dotenv";
+
 import { ApiError } from "./utils/ApiError.js";
-import { analyzeVideoComplexity } from "./helper/contentAnalyzer.js";
-import { updateStatus } from "./helper/updateStatus.js";
-import { storeMetadataToDynamo } from "./helper/metaDataStore.js";
-import { generateResolutions } from "./pipeline/transcoder.js";
 import { s3 } from "./clients/s3Client.js";
-import { uploadProcessedFile } from "./pipeline/uploadTos3.js";
+import { storeMetadataToDynamo } from "./helper/metaDataStore.js";
+import { analyzeVideoComplexity } from "./pipeline/services/contentAnalyzer.js";
+import { generateLadder } from "./pipeline/services/generateLadder.js";
+import { transcodeHLSFromRecipe } from "./pipeline/transcoder.js";
+import { uploadHLSDirectory } from "./pipeline/uploadTos3.js";
+import { updateStatus } from "./helper/updateStatus.js";
 
 dotenv.config();
 
+const isLocal = process.env.RUN_MODE === "local";
+
 const run = async () => {
-    const messagePath = path.resolve("sqs-message.json");
-    if(!messagePath){
-        throw new ApiError(500, "Message path wont exists or there is an error in sqs messaging poller")
+    let bucket, key, videoId;
+
+    if (isLocal) {
+        const messagePath = path.resolve("sqs-message.json");
+        console.log("📩 Running in LOCAL mode. Reading message from:", messagePath);
+
+        let message;
+        try {
+            message = JSON.parse(await fs.readFile(messagePath, "utf-8"));
+        } catch (e) {
+            console.error("❌ Failed to read message file:", e);
+            return;
+        }
+
+        const parsedBody = JSON.parse(message.Body);
+        const record = parsedBody.Records?.[0];
+
+        if (!record) {
+            console.log("⚠️ No valid S3 record found.");
+            return;
+        }
+
+        bucket = record.s3.bucket.name;
+        key = decodeURIComponent(record.s3.object.key.replace(/\+/g, " "));
+    } else {
+        console.log("🚀 Running in PRODUCTION (Fargate) mode.");
+        console.log("Data We got is: ", process.env.BUCKET, process.env.KEY);
+        bucket = process.env.BUCKET;
+        key = decodeURIComponent(process.env.KEY || "");
     }
-    console.log("📩 Reading SQS message from:", messagePath);
 
-    let message;
-    try {
-        message = JSON.parse(await fs.readFile(messagePath, "utf-8"));
-    } catch (e) {
-        console.error("❌ Failed to read message file:", e);
-        return;
+    if (!bucket || !key) {
+        throw new ApiError(500, "Missing bucket or key");
     }
 
-    console.log("📬 Message received:", message);
-
-    const parsedBody = JSON.parse(message.Body);
-    const record = parsedBody.Records?.[0];
-    if (!record) {
-        console.log("⚠️ No valid S3 record found.");
-        return;
-    }
-
-    const bucket = record.s3.bucket.name;
-    const key = decodeURIComponent(record.s3.object.key.replace(/\+/g, " "));
-    const videoId = path.basename(key, path.extname(key));
-
+    videoId = path.basename(key, path.extname(key));
+    const localInputPath = path.join("tmp", `${videoId}.mp4`);
     const tempDir = path.resolve("tmp");
+
     await fs.mkdir(tempDir, { recursive: true });
-    const localInputPath = path.join(tempDir, path.basename(key));
 
     console.log("📦 S3 Bucket:", bucket);
     console.log("🔑 S3 Key:", key);
 
     try {
-        const localInputPath = path.join('tmp', `${videoId}.mp4`);
-
         console.log("📥 Downloading video from S3...");
         const videoStream = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-
         await pipeline(videoStream.Body, createWriteStream(localInputPath));
-        console.log("✅ Download complete. Saved to:", localInputPath);
+        console.log("✅ Download complete:", localInputPath);
 
-        console.log("📊 Analyzing video complexity...");
+        console.log("📊 Running content analysis...");
         const metadata = await analyzeVideoComplexity(localInputPath);
-        console.log("📈 Metadata:", metadata);
         await storeMetadataToDynamo(videoId, metadata);
 
-        console.log("🎞️ Running FFmpeg for all resolutions...");
-        const processedPaths = await generateResolutions(localInputPath, videoId);
+        console.log("📐 Generating ladder...");
+        const recipe = generateLadder(metadata);
+        console.log("📋 Recipe:", recipe);
 
-        for (const outputPath of processedPaths) {
-            await uploadProcessedFile({
+        console.log("🎞️ Transcoding video...");
+        const { variants, outputDir } = await transcodeHLSFromRecipe(localInputPath, videoId, recipe);
+
+        if (!Array.isArray(variants)) {
+            throw new Error("transcodeHLSFromRecipe must return a variants array");
+        }
+
+        for (const variant of variants) {
+            const localDir = path.join(outputDir, `${variant.resolution}p`);
+            console.log(`📤 Uploading HLS for ${variant.resolution}p from ${localDir}`);
+
+            await uploadHLSDirectory({
                 bucket,
-                key,
-                videoId,
-                outputPath,
+                localDir,
+                s3Prefix: `processed/${videoId}/${variant.resolution}p`,
                 s3
             });
         }
 
         await updateStatus(videoId, "done");
-        console.log("🎉 Processing complete for:", videoId);
-
+        console.log("✅ Processing complete for:", videoId);
     } catch (err) {
-        console.error("❌ Error during processing:", err);
+        console.error("❌ Processing error:", err);
         await updateStatus(videoId, "failed");
     } finally {
         console.log("🧹 Cleaning up...");
         try {
+            await rm(path.join("tmp", videoId), { recursive: true, force: true });
             await fs.unlink(localInputPath);
-            await fs.unlink(messagePath);
+            if (isLocal) {
+                await fs.unlink(path.resolve("sqs-message.json"));
+            }
             console.log("🧼 Temp files removed.");
         } catch (e) {
             console.warn("⚠️ Cleanup failed:", e.message);
